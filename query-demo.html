@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BSC钱包每日盈亏统计工具（价格接口修复）</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {box-sizing: border-box;margin:0;padding:0;font-family:system-ui, sans-serif;}
+        body {background:#0f172a;color:#e2e8f0;padding:20px;max-width:1400px;margin:0 auto;}
+        .container {display:grid;grid-template-columns:1fr 1fr;gap:24px;}
+        @media (max-width:900px) {.container {grid-template-columns:1fr;}}
+        .card {background:#1e293b;border-radius:12px;padding:20px;box-shadow:0 4px 12px #0003;}
+        h2 {margin-bottom:16px;color:#38bdf8;font-size:18px;}
+        .input-row {display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;}
+        input, button, select {padding:10px 12px;border-radius:8px;border:none;font-size:14px;}
+        input {flex:1;min-width:260px;background:#334155;color:#fff;outline:#38bdf8 solid 2px transparent;}
+        input:focus {outline-color:#38bdf8;}
+        button {background:#2563eb;color:#fff;cursor:pointer;font-weight:600;transition:0.2s;}
+        button:disabled {background:#475569;cursor:not-allowed;}
+        .stat-wrap {display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0;}
+        .stat-item {background:#334155;padding:12px;border-radius:8px;text-align:center;}
+        .stat-label {font-size:12px;color:#94a3b8;margin-bottom:4px;}
+        .stat-value {font-size:16px;font-weight:bold;}
+        .profit {color:#4ade80;}
+        .loss {color:#f87171;}
+        table {width:100%;border-collapse:collapse;margin-top:12px;font-size:13px;}
+        th,td {padding:10px;border-bottom:1px solid #334155;text-align:left;}
+        th {color:#94a3b8;}
+        a {color:#38bdf8;text-decoration:none;}
+        .chart-box {height:360px;margin-top:10px;}
+        .loading {color:#38bdf8;padding:20px;text-align:center;}
+        .empty {color:#94a3b8;padding:20px;text-align:center;}
+    </style>
+</head>
+<body>
+    <h1 style="margin-bottom:24px;color:#fff">BSC钱包链上盈亏分析工具（UTC日期/V2API）</h1>
+    <div class="input-row">
+        <input id="walletAddr" placeholder="输入BSC钱包地址 0x..." />
+        <input type="date" id="queryDate" />
+        <button id="queryBtn">查询当日交易&盈亏</button>
+        <button id="chart30Btn">加载近30天盈亏曲线</button>
+    </div>
+
+    <div class="container">
+        <div class="card">
+            <h2>指定日期（UTC）盈亏汇总</h2>
+            <div class="stat-wrap" id="statPanel"></div>
+            <div id="loadingTip" class="loading" style="display:none">正在拉取链上数据...</div>
+            <div id="emptyTip" class="empty" style="display:none">暂无交易记录</div>
+            <table id="txTable">
+                <thead>
+                    <tr>
+                        <th>UTC时间</th>
+                        <th>收支类型</th>
+                        <th>金额(BNB)</th>
+                        <th>Gas手续费(BNB)</th>
+                        <th>交易哈希</th>
+                    </tr>
+                </thead>
+                <tbody id="txBody"></tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>近30天每日盈亏走势(USD)</h2>
+            <div class="chart-box">
+                <canvas id="profitChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 配置区
+        const BSCSCAN_API_KEY = "NFIXSTBAHI6S2YNQ3VR25N6DU2BVX9BPYA";
+        const API_BASE = "https://api.bscscan.com/v2";
+        const CHAIN_ID = 56;
+        let bnbPriceUSD = 0;
+        let chartInstance = null;
+
+        const walletAddrEl = document.getElementById("walletAddr");
+        const queryDateEl = document.getElementById("queryDate");
+        const queryBtn = document.getElementById("queryBtn");
+        const chart30Btn = document.getElementById("chart30Btn");
+        const statPanel = document.getElementById("statPanel");
+        const loadingTip = document.getElementById("loadingTip");
+        const emptyTip = document.getElementById("emptyTip");
+        const txBody = document.getElementById("txBody");
+        const profitChartCanvas = document.getElementById("profitChart");
+
+        // 默认UTC今日
+        const now = new Date();
+        const todayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+        queryDateEl.valueAsDate = todayUTC;
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // 通用请求封装
+        async function safeFetch(url) {
+            const res = await fetch(url);
+            if (!res.ok) {
+                if (res.status === 403) throw new Error("API密钥无效，请检查BSCSCAN KEY");
+                if (res.status === 429) throw new Error("接口限流，请稍后重试");
+                throw new Error(`请求失败，状态码：${res.status}`);
+            }
+            return await res.json();
+        }
+
+        // 【修复核心】CoinGecko 获取BNB价格，无需API Key
+        async function fetchBNBPrice() {
+            try {
+                // CoinGecko 无密钥稳定接口
+                const cgUrl = "https://api.coingecko.com/api/v3/coins/binancecoin?localization=false&tickers=false&community_data=false&developer_data=false";
+                const cgData = await safeFetch(cgUrl);
+                const price = cgData?.market_data?.current_price?.usd;
+                if (price && price > 0) {
+                    bnbPriceUSD = Number(price);
+                    return;
+                }
+            } catch (e) {
+                console.log("CoinGecko价格接口失败，切换BSCScan兜底", e);
+            }
+
+            // 兜底：BSCScan v2
+            const bsUrl = `${API_BASE}?module=stats&action=bnbprice&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
+            const bsData = await safeFetch(bsUrl);
+            const data = bsData?.data;
+            if (!data || !data.bnbusd || Number(data.bnbusd) <= 0) {
+                throw new Error("无法获取BNB实时美元价格，CoinGecko与BSCScan均失效");
+            }
+            bnbPriceUSD = Number(data.bnbusd);
+        }
+
+        // UTC日期时间戳区间
+        function getUTCDayRange(dateStr) {
+            const d = new Date(dateStr);
+            const start = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), 0,0,0) / 1000;
+            const end = Date.UTC(d.getFullYear(), d.getUTCMonth(), d.getUTCDate(), 23,59,59) / 1000;
+            return {startTs: start, endTs: end};
+        }
+
+        function formatUTC(ts) {
+            const dt = new Date(ts * 1000);
+            return dt.toUTCString();
+        }
+
+        function weiToBNB(weiStr) {
+            return Number(BigInt(weiStr) / BigInt(10**18));
+        }
+
+        // 时间戳查区块高度
+        async function getBlockByTs(ts) {
+            const url = `${API_BASE}?module=block&action=getblocknobytime&timestamp=${ts}&closest=before&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
+            const json = await safeFetch(url);
+            const data = json?.data;
+            if (!data) throw new Error("查询区块高度失败");
+            return Number(data);
+        }
+
+        // 获取BNB转账+BEP20转账
+        async function getAllTx(address, startBlock, endBlock) {
+            await sleep(400);
+            const txUrl = `${API_BASE}?module=account&action=txlist&address=${address}&startblock=${startBlock}&endblock=${endBlock}&sort=asc&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
+            const txJson = await safeFetch(txUrl);
+            const txList = txJson?.data || [];
+
+            await sleep(400);
+            const tokenUrl = `${API_BASE}?module=account&action=tokentx&address=${address}&startblock=${startBlock}&endblock=${endBlock}&sort=asc&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
+            const tokenJson = await safeFetch(tokenUrl);
+            const tokenList = tokenJson?.data || [];
+
+            const all = [...txList, ...tokenList];
+            all.sort((a,b) => Number(a.timeStamp) - Number(b.timeStamp));
+            return all;
+        }
+
+        // 盈亏计算
+        function calcDailyProfit(txs, wallet) {
+            let totalInBNB = 0;
+            let totalOutBNB = 0;
+            let totalGasBNB = 0;
+            const txRecords = [];
+            wallet = wallet.toLowerCase();
+
+            for(const tx of txs) {
+                const ts = Number(tx.timeStamp);
+                const hash = tx.hash;
+                const from = tx.from?.toLowerCase() || "";
+                const to = tx.to ? tx.to.toLowerCase() : "";
+                let amountBNB = 0;
+                let gasBNB = 0;
+                let type = "";
+
+                if(tx.value !== undefined && !tx.tokenDecimal) {
+                    amountBNB = weiToBNB(tx.value);
+                    gasBNB = weiToBNB(BigInt(tx.gasUsed) * BigInt(tx.gasPrice));
+                    totalGasBNB += gasBNB;
+                    if(from === wallet) {
+                        type = "支出";
+                        totalOutBNB += amountBNB;
+                    } else {
+                        type = "收入";
+                        totalInBNB += amountBNB;
+                    }
+                } else if(tx.tokenDecimal) {
+                    const dec = Number(tx.tokenDecimal);
+                    const amount = Number(tx.value) / (10**dec);
+                    amountBNB = amount / 100;
+                    type = from === wallet ? "代币转出" : "代币转入";
+                    from === wallet ? totalOutBNB += amountBNB : totalInBNB += amountBNB;
+                }
+
+                txRecords.push({time: formatUTC(ts), type, amountBNB, gasBNB, hash});
+            }
+
+            const netBNB = totalInBNB - totalOutBNB - totalGasBNB;
+            const netUSD = netBNB * bnbPriceUSD;
+            return {totalInBNB, totalOutBNB, totalGasBNB, netBNB, netUSD, txRecords};
+        }
+
+        function renderStat(data) {
+            statPanel.innerHTML = `
+                <div class="stat-item">
+                    <div class="stat-label">当日总收入(BNB)</div>
+                    <div class="stat-value profit">${data.totalInBNB.toFixed(4)}</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">当日总支出(BNB)</div>
+                    <div class="stat-value loss">${data.totalOutBNB.toFixed(4)}</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">总Gas手续费(BNB)</div>
+                    <div class="stat-value">${data.totalGasBNB.toFixed(4)}</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">当日净盈亏(USD)</div>
+                    <div class="stat-value ${data.netUSD >=0 ? 'profit' : 'loss'}">${data.netUSD.toFixed(2)}</div>
+                </div>
+            `;
+        }
+
+        function renderTxList(records) {
+            txBody.innerHTML = "";
+            if(records.length === 0) {
+                emptyTip.style.display = "block";
+                return;
+            }
+            emptyTip.style.display = "none";
+            records.forEach(item => {
+                const tr = document.createElement("tr");
+                tr.innerHTML = `
+                    <td>${item.time}</td>
+                    <td>${item.type}</td>
+                    <td class="${item.type.includes('收入') ? 'profit' : 'loss'}">${item.amountBNB.toFixed(6)}</td>
+                    <td>${item.gasBNB.toFixed(6)}</td>
+                    <td><a href="https://bscscan.com/tx/${item.hash}" target="_blank">${item.hash.slice(0,10)}...</a></td>
+                `;
+                txBody.appendChild(tr);
+            });
+        }
+
+        // 单日查询
+        queryBtn.addEventListener("click", async () => {
+            const addr = walletAddrEl.value.trim().toLowerCase();
+            const date = queryDateEl.value;
+            if(!addr || !addr.startsWith("0x") || addr.length !== 42) {
+                alert("请输入合法BSC钱包地址（0x开头42位）");
+                return;
+            }
+            if(!date) {
+                alert("请选择查询日期");
+                return;
+            }
+
+            loadingTip.style.display = "block";
+            statPanel.innerHTML = "";
+            txBody.innerHTML = "";
+            emptyTip.style.display = "none";
+            queryBtn.disabled = true;
+
+            try {
+                await fetchBNBPrice();
+                const {startTs, endTs} = getUTCDayRange(date);
+                const startBlock = await getBlockByTs(startTs);
+                const endBlock = await getBlockByTs(endTs);
+                const txs = await getAllTx(addr, startBlock, endBlock);
+                const dailyData = calcDailyProfit(txs, addr);
+                renderStat(dailyData);
+                renderTxList(dailyData.txRecords);
+            } catch (err) {
+                alert("查询失败：" + err.message);
+                console.error(err);
+            } finally {
+                loadingTip.style.display = "none";
+                queryBtn.disabled = false;
+            }
+        });
+
+        // 30天曲线
+        chart30Btn.addEventListener("click", async () => {
+            const addr = walletAddrEl.value.trim().toLowerCase();
+            if(!addr || !addr.startsWith("0x")) {
+                alert("请先输入钱包地址");
+                return;
+            }
+            chart30Btn.disabled = true;
+            try {
+                await fetchBNBPrice();
+                const dayLabels = [];
+                const profitData = [];
+
+                for(let i=29; i>=0; i--) {
+                    const dayDate = new Date();
+                    dayDate.setUTCDate(dayDate.getUTCDate() - i);
+                    const dateStr = dayDate.toISOString().split("T")[0];
+                    dayLabels.push(dateStr);
+
+                    const {startTs, endTs} = getUTCDayRange(dateStr);
+                    const startBlock = await getBlockByTs(startTs);
+                    const endBlock = await getBlockByTs(endTs);
+                    const txs = await getAllTx(addr, startBlock, endBlock);
+                    const dayProfit = calcDailyProfit(txs, addr);
+                    profitData.push(dayProfit.netUSD);
+                }
+
+                if(chartInstance) chartInstance.destroy();
+                chartInstance = new Chart(profitChartCanvas, {
+                    type: "line",
+                    data: {
+                        labels: dayLabels,
+                        datasets: [{
+                            label: "每日净盈亏(USD)",
+                            data: profitData,
+                            borderColor: "#38bdf8",
+                            backgroundColor: "rgba(56, 189, 248, 0.1)",
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            tooltip: {callbacks: {label: ctx => `盈亏: $${ctx.raw.toFixed(2)}`}}
+                        },
+                        scales: {
+                            y: {grid: {color: "rgba(255,255,255,0.08)"}, ticks: {color: "#94a3b8"}},
+                            x: {grid: {display: false}, ticks: {color: "#94a3b8", maxRotation: 45}}
+                        }
+                    }
+                });
+            } catch(e) {
+                alert("30天数据加载失败：" + e.message);
+                console.error(e);
+            } finally {
+                chart30Btn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
