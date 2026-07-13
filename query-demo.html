@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BSC钱包每日盈亏统计工具（价格接口修复）</title>
+    <title>BSC钱包每日盈亏统计工具（移除区块查询接口）</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * {box-sizing: border-box;margin:0;padding:0;font-family:system-ui, sans-serif;}
@@ -108,10 +108,9 @@
             return await res.json();
         }
 
-        // 【修复核心】CoinGecko 获取BNB价格，无需API Key
+        // CoinGecko 获取BNB价格，无需密钥
         async function fetchBNBPrice() {
             try {
-                // CoinGecko 无密钥稳定接口
                 const cgUrl = "https://api.coingecko.com/api/v3/coins/binancecoin?localization=false&tickers=false&community_data=false&developer_data=false";
                 const cgData = await safeFetch(cgUrl);
                 const price = cgData?.market_data?.current_price?.usd;
@@ -122,18 +121,17 @@
             } catch (e) {
                 console.log("CoinGecko价格接口失败，切换BSCScan兜底", e);
             }
-
-            // 兜底：BSCScan v2
+            // BscScan兜底
             const bsUrl = `${API_BASE}?module=stats&action=bnbprice&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
             const bsData = await safeFetch(bsUrl);
             const data = bsData?.data;
             if (!data || !data.bnbusd || Number(data.bnbusd) <= 0) {
-                throw new Error("无法获取BNB实时美元价格，CoinGecko与BSCScan均失效");
+                throw new Error("无法获取BNB实时美元价格");
             }
             bnbPriceUSD = Number(data.bnbusd);
         }
 
-        // UTC日期时间戳区间
+        // 获取UTC当天起止时间戳
         function getUTCDayRange(dateStr) {
             const d = new Date(dateStr);
             const start = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), 0,0,0) / 1000;
@@ -150,24 +148,16 @@
             return Number(BigInt(weiStr) / BigInt(10**18));
         }
 
-        // 时间戳查区块高度
-        async function getBlockByTs(ts) {
-            const url = `${API_BASE}?module=block&action=getblocknobytime&timestamp=${ts}&closest=before&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
-            const json = await safeFetch(url);
-            const data = json?.data;
-            if (!data) throw new Error("查询区块高度失败");
-            return Number(data);
-        }
-
-        // 获取BNB转账+BEP20转账
-        async function getAllTx(address, startBlock, endBlock) {
+        // 核心改动：不再查询区块高度，直接拉取全量交易，前端按时间戳过滤
+        async function getAllTx(address) {
             await sleep(400);
-            const txUrl = `${API_BASE}?module=account&action=txlist&address=${address}&startblock=${startBlock}&endblock=${endBlock}&sort=asc&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
+            // 拉取全部历史交易（startblock=0，endblock=99999999）
+            const txUrl = `${API_BASE}?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&sort=desc&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
             const txJson = await safeFetch(txUrl);
             const txList = txJson?.data || [];
 
             await sleep(400);
-            const tokenUrl = `${API_BASE}?module=account&action=tokentx&address=${address}&startblock=${startBlock}&endblock=${endBlock}&sort=asc&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
+            const tokenUrl = `${API_BASE}?module=account&action=tokentx&address=${address}&startblock=0&endblock=99999999&sort=desc&chainid=${CHAIN_ID}&apikey=${BSCSCAN_API_KEY}`;
             const tokenJson = await safeFetch(tokenUrl);
             const tokenList = tokenJson?.data || [];
 
@@ -176,19 +166,21 @@
             return all;
         }
 
-        // 盈亏计算
-        function calcDailyProfit(txs, wallet) {
+        // 根据时间戳过滤当日交易 + 盈亏计算
+        function filterAndCalcProfit(allTxs, startTs, endTs, wallet) {
             let totalInBNB = 0;
             let totalOutBNB = 0;
             let totalGasBNB = 0;
             const txRecords = [];
             wallet = wallet.toLowerCase();
 
-            for(const tx of txs) {
+            for(const tx of allTxs) {
                 const ts = Number(tx.timeStamp);
+                // 只保留当天时间区间内交易
+                if (ts < startTs || ts > endTs) continue;
+
                 const hash = tx.hash;
                 const from = tx.from?.toLowerCase() || "";
-                const to = tx.to ? tx.to.toLowerCase() : "";
                 let amountBNB = 0;
                 let gasBNB = 0;
                 let type = "";
@@ -197,13 +189,8 @@
                     amountBNB = weiToBNB(tx.value);
                     gasBNB = weiToBNB(BigInt(tx.gasUsed) * BigInt(tx.gasPrice));
                     totalGasBNB += gasBNB;
-                    if(from === wallet) {
-                        type = "支出";
-                        totalOutBNB += amountBNB;
-                    } else {
-                        type = "收入";
-                        totalInBNB += amountBNB;
-                    }
+                    type = from === wallet ? "支出" : "收入";
+                    from === wallet ? totalOutBNB += amountBNB : totalInBNB += amountBNB;
                 } else if(tx.tokenDecimal) {
                     const dec = Number(tx.tokenDecimal);
                     const amount = Number(tx.value) / (10**dec);
@@ -283,10 +270,9 @@
             try {
                 await fetchBNBPrice();
                 const {startTs, endTs} = getUTCDayRange(date);
-                const startBlock = await getBlockByTs(startTs);
-                const endBlock = await getBlockByTs(endTs);
-                const txs = await getAllTx(addr, startBlock, endBlock);
-                const dailyData = calcDailyProfit(txs, addr);
+                // 一次性拉取全部交易，前端过滤日期
+                const allTxs = await getAllTx(addr);
+                const dailyData = filterAndCalcProfit(allTxs, startTs, endTs, addr);
                 renderStat(dailyData);
                 renderTxList(dailyData.txRecords);
             } catch (err) {
@@ -308,6 +294,8 @@
             chart30Btn.disabled = true;
             try {
                 await fetchBNBPrice();
+                // 一次性拉取全部交易，30天复用这份数据，减少接口请求
+                const allTxs = await getAllTx(addr);
                 const dayLabels = [];
                 const profitData = [];
 
@@ -316,13 +304,10 @@
                     dayDate.setUTCDate(dayDate.getUTCDate() - i);
                     const dateStr = dayDate.toISOString().split("T")[0];
                     dayLabels.push(dateStr);
-
                     const {startTs, endTs} = getUTCDayRange(dateStr);
-                    const startBlock = await getBlockByTs(startTs);
-                    const endBlock = await getBlockByTs(endTs);
-                    const txs = await getAllTx(addr, startBlock, endBlock);
-                    const dayProfit = calcDailyProfit(txs, addr);
+                    const dayProfit = filterAndCalcProfit(allTxs, startTs, endTs, addr);
                     profitData.push(dayProfit.netUSD);
+                    await sleep(100);
                 }
 
                 if(chartInstance) chartInstance.destroy();
